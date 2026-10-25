@@ -1,6 +1,7 @@
 # Builds uWhisper.exe and installs it to %LOCALAPPDATA%\Programs\uWhisper.
 # Run again after changing the code:  powershell -ExecutionPolicy Bypass -File build_exe.ps1
-# The build happens outside OneDrive (it's ~2 GB of GPU libraries).
+# NVIDIA's GPU libraries are NOT bundled: the app downloads cuBLAS on first run on PCs
+# with an NVIDIA card (see uwhisper_gpu.py). The build happens outside OneDrive.
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $here ".venv\Scripts\python.exe"
@@ -15,9 +16,8 @@ $dest = Join-Path $env:LOCALAPPDATA "Programs\uWhisper"
     --add-data "$(Join-Path $here 'uWhisper.ico');." `
     --collect-data faster_whisper `
     --collect-binaries ctranslate2 `
-    --collect-binaries nvidia.cublas `
-    --collect-binaries nvidia.cudnn `
-    --collect-binaries nvidia.cuda_nvrtc `
+    --exclude-module nvidia `
+    --exclude-module av `
     --collect-binaries onnxruntime `
     --collect-binaries _sounddevice_data `
     --collect-binaries _soundfile_data `

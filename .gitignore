@@ -5,3 +5,5 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+tests/fixtures/tts/
+tests/screenshots/

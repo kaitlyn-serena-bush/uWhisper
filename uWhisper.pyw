@@ -2,8 +2,9 @@
 waveform) to stop. The recording is saved, transcribed on the GPU, pasted into
 the window you were typing in, and copied to the clipboard.
 
-Files:  Music\\uWhisper\\audio\\<timestamp>.wav
-        Music\\uWhisper\\text\\<timestamp>.txt
+Files:  C:\\Users\\<you>\\Documents\\uWhisper\\audio\\<timestamp>.wav   (deleted after 30 days by default)
+        C:\\Users\\<you>\\Documents\\uWhisper\\text\\<timestamp>.txt    (kept forever)
+        Always on this PC, never in OneDrive.
 Settings and log: %USERPROFILE%\\.uwhisper\\
 """
 import collections
@@ -15,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -60,12 +62,15 @@ if sys.stdout:  # running with python.exe: also log to the console
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 
 
-def music_folder():
-    """The real Music folder, even if Windows/OneDrive moved it."""
+FOLDERID_MUSIC = "{4BD8D571-6D19-48D3-BE97-422220080E43}"
+FOLDERID_DOCUMENTS = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+
+
+def known_folder(folder_id, fallback):
+    """A real Windows folder (Music, Documents), even if Windows/OneDrive moved it."""
     try:
         import uuid
-        folderid_music = uuid.UUID("{4BD8D571-6D19-48D3-BE97-422220080E43}")
-        guid = (ctypes.c_byte * 16).from_buffer_copy(folderid_music.bytes_le)
+        guid = (ctypes.c_byte * 16).from_buffer_copy(uuid.UUID(folder_id).bytes_le)
         path = ctypes.c_wchar_p()
         if ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path)) == 0:
             result = path.value
@@ -73,14 +78,26 @@ def music_folder():
             return result
     except Exception:
         pass
-    return os.path.join(os.path.expanduser("~"), "Music")
+    return os.path.join(os.path.expanduser("~"), fallback)
 
 
-OUT_DIR = os.path.join(music_folder(), APP)
-AUDIO_DIR = os.path.join(OUT_DIR, "audio")
-TEXT_DIR = os.path.join(OUT_DIR, "text")
-os.makedirs(AUDIO_DIR, exist_ok=True)
-os.makedirs(TEXT_DIR, exist_ok=True)
+import uwhisper_storage as storage  # noqa: E402
+
+# Everything stays on this PC. The local C:\Users\<name>\Documents folder is used on
+# purpose, NOT Windows' "Documents" location, which OneDrive often redirects to the cloud.
+OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", APP)
+OLD_OUT_DIRS = [  # earlier versions saved here; move anything found into OUT_DIR
+    os.path.join(known_folder(FOLDERID_MUSIC, "Music"), APP),
+    os.path.join(known_folder(FOLDERID_DOCUMENTS, "Documents"), APP),  # maybe OneDrive
+]
+AUDIO_DIR, TEXT_DIR = storage.make_folders(OUT_DIR)
+for _old in OLD_OUT_DIRS:
+    try:
+        _moved = storage.migrate(_old, OUT_DIR, log=log.warning)
+        if _moved:
+            log.info("moved %d old recordings from %s to %s", _moved, _old, OUT_DIR)
+    except Exception:
+        log.exception("could not move old recordings from %s", _old)
 
 
 class Config:
@@ -88,19 +105,36 @@ class Config:
         self.device = None      # microphone name, None = Windows default
         self.hotkey = HOTKEY
         self.whisper = {}       # speech-to-text settings (merged with defaults later)
+        self.cleanup = storage.normalize_cleanup(None)  # how long audio is kept
         try:
             with open(CONF_PATH, encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("config is not an object")
             self.device = data.get("device")
             self.hotkey = data.get("hotkey") or HOTKEY
             self.whisper = data.get("whisper") or {}
-        except Exception:
+            if not isinstance(self.whisper, dict):
+                self.whisper = {}
+            self.cleanup = storage.normalize_cleanup(data.get("cleanup"))
+        except FileNotFoundError:
             pass
+        except Exception:
+            log.exception("config unreadable, using defaults (old copy kept as config.json.bad)")
+            try:
+                shutil.copyfile(CONF_PATH, CONF_PATH + ".bad")
+            except OSError:
+                pass
+        combo = normalize_hotkey(self.hotkey) if isinstance(self.hotkey, str) else None
+        self.hotkey = combo or HOTKEY
 
     def save(self):
-        with open(CONF_PATH, "w", encoding="utf-8") as f:
+        # Write to a temp file first so a crash mid-save can't wipe the settings.
+        tmp = CONF_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"device": self.device, "hotkey": self.hotkey,
-                       "whisper": self.whisper}, f, indent=2)
+                       "whisper": self.whisper, "cleanup": self.cleanup}, f, indent=2)
+        os.replace(tmp, CONF_PATH)
 
 
 MODIFIERS = {"ctrl", "shift", "alt", "windows"}
@@ -118,11 +152,13 @@ def normalize_hotkey(combo):
     keys = [p for p in parts if p not in MODIFIERS]
     if len(keys) != 1 or keys[0] in ("esc", "escape"):
         return None
-    is_fkey = keys[0].startswith("f") and keys[0][1:].isdigit()
+    is_fkey = keys[0].startswith("f") and keys[0][1:].isdigit() and 1 <= int(keys[0][1:]) <= 24
     if not mods and not is_fkey:
         return None  # a bare letter would hijack normal typing
     order = ["ctrl", "alt", "shift", "windows"]
-    return "+".join(sorted(mods, key=order.index) + keys)
+    combo = "+".join(sorted(mods, key=order.index) + keys)
+    from uwhisper_hotkey import parse  # only keep combos Windows can actually register
+    return combo if parse(combo) else None
 
 
 def hotkey_label(combo):
@@ -140,6 +176,7 @@ import soundfile as sf  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
 import uwhisper_engine  # noqa: E402
+import uwhisper_gpu as gpu  # noqa: E402
 from uwhisper_hotkey import SystemHotkey  # noqa: E402
 import uwhisper_theme as T  # noqa: E402
 from uwhisper_logo import draw_icon  # noqa: E402
@@ -185,6 +222,17 @@ def focus_window(hwnd):
     user32.SetForegroundWindow(hwnd)
     user32.AttachThreadInput(fg_thread, me, False)
     time.sleep(0.08)
+
+
+def wait_for_modifiers_released(timeout=1.0):
+    """If Shift/Alt/Win from the hotkey are still held, Ctrl+V would become
+    Ctrl+Shift+V or Ctrl+Alt+V (Paste Special). Wait briefly for them to come up."""
+    keys = (0x10, 0x11, 0x12, 0x5B, 0x5C)  # Shift, Ctrl, Alt, left/right Win
+    end = time.time() + timeout
+    while time.time() < end:
+        if not any(user32.GetAsyncKeyState(k) & 0x8000 for k in keys):
+            return
+        time.sleep(0.02)
 
 
 # ---------------------------------------------------------------- autostart
@@ -266,16 +314,34 @@ class Recorder:
 
     def start(self, mic_name, path):
         idx, info = resolve_mic(mic_name)
+        if idx is None or idx < 0:
+            raise RuntimeError("no microphone found")
         rate = int(info["default_samplerate"])
         channels = min(2, int(info["max_input_channels"]))
-        self.path = path
         self._q = queue.Queue()
-        self._file = sf.SoundFile(path, "w", samplerate=rate, channels=channels, subtype="PCM_16")
+        # Open the mic first: if it fails, nothing is left half-open.
+        stream = sd.InputStream(device=idx, samplerate=rate, channels=channels,
+                                dtype="float32", callback=self._callback)
+        try:
+            self._file = sf.SoundFile(path, "w", samplerate=rate, channels=channels, subtype="PCM_16")
+        except Exception:
+            stream.close()
+            raise
+        self.path = path
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._writer.start()
-        self.stream = sd.InputStream(device=idx, samplerate=rate, channels=channels,
-                                     dtype="float32", callback=self._callback)
-        self.stream.start()
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            self._q.put(None)
+            self._writer.join()
+            try:
+                os.remove(path)  # empty file, nothing worth keeping
+            except OSError:
+                pass
+            raise
+        self.stream = stream
         self.started = time.time()
         log.info("recording from %s (%d Hz, %d ch) -> %s", info["name"], rate, channels, path)
 
@@ -298,13 +364,17 @@ class Recorder:
         self._file.close()
 
     def stop(self):
-        try:
-            self.stream.stop()
-            self.stream.close()
-        finally:
-            self.stream = None
-            self._q.put(None)
-            self._writer.join()
+        """Stop and finish the file. Never raises (an unplugged mic can make stop() fail)."""
+        if self.stream is None:
+            return 0.0
+        stream, self.stream = self.stream, None
+        for fn in (stream.stop, stream.close):
+            try:
+                fn()
+            except Exception:
+                log.exception("mic stream did not stop cleanly")
+        self._q.put(None)
+        self._writer.join()
         return time.time() - self.started
 
     def take_level(self):
@@ -502,7 +572,75 @@ class App:
         self.hotkey = SystemHotkey(on_press=self._hotkey_pressed)
         self._bind_hotkey()
         self.root.after(30, self._pump)
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_job = None
+        self.root.after(3000, self._cleanup_tick)
         log.info("started; output -> %s", OUT_DIR)
+
+    # -- daily audio clean-up
+    CLEANUP_CHECK_MS = 30 * 60 * 1000  # look every 30 minutes; it only runs once per day
+
+    def _cleanup_tick(self):
+        try:
+            if storage.due(self.cfg.cleanup.get("last_run"), datetime.date.today()):
+                self.run_cleanup()
+        except Exception:
+            log.exception("clean-up check failed")
+        self.root.after(self.CLEANUP_CHECK_MS, self._cleanup_tick)
+
+    def run_cleanup(self):
+        """Delete audio older than the user's setting (in the background)."""
+        self.cfg.cleanup["last_run"] = datetime.date.today().isoformat()
+        try:
+            self.cfg.save()
+        except Exception:
+            log.exception("could not save config")
+        days = storage.keep_days(self.cfg.cleanup["amount"], self.cfg.cleanup["unit"])
+        if days is None:
+            return
+        busy = self.recorder.path if self.state != "idle" else None
+
+        def work():
+            if not self._cleanup_lock.acquire(blocking=False):
+                return  # one already running
+            try:
+                n, freed = storage.delete_old_audio(AUDIO_DIR, days, datetime.datetime.now(),
+                                                    keep=[busy], log=log.warning)
+                log.info("clean-up: deleted %d recordings older than %d days (%.1f MB)",
+                         n, days, freed / 1e6)
+            finally:
+                self._cleanup_lock.release()
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_cleanup(self, amount=None, unit=None):
+        c = dict(self.cfg.cleanup)
+        if amount is not None:
+            c["amount"] = amount
+        if unit is not None:
+            c["unit"] = unit
+        c = storage.normalize_cleanup(c)
+        if (c["amount"], c["unit"]) == (self.cfg.cleanup["amount"], self.cfg.cleanup["unit"]):
+            return
+        self.cfg.cleanup = c
+        try:
+            self.cfg.save()
+        except Exception:
+            log.exception("could not save config")
+        log.info("keep audio for %s", storage.describe(c["amount"], c["unit"]))
+        # Apply it soon, not tomorrow - but not instantly: someone going from "30 days" to
+        # "2 weeks" passes through "2 days" on the way, and that must not delete anything.
+        if self._cleanup_job:
+            self.root.after_cancel(self._cleanup_job)
+        self._cleanup_job = self.root.after(self.CLEANUP_DELAY_MS, self._delayed_cleanup)
+
+    CLEANUP_DELAY_MS = 30 * 1000
+
+    def _delayed_cleanup(self):
+        self._cleanup_job = None
+        if self.panel.win and self.panel.editing == "keep_amount":
+            self._cleanup_job = self.root.after(self.CLEANUP_DELAY_MS, self._delayed_cleanup)
+            return  # still typing
+        self.run_cleanup()
 
     # -- background model load
     def reload_engine(self):
@@ -526,9 +664,56 @@ class App:
             except Exception as e:
                 log.exception("model failed to load")
                 self.engine_error = e
+                self.ui.put(lambda: self.overlay.message(
+                    "Speech model failed to load (offline?) - press your shortcut to retry",
+                    T.ERR_TEXT, 6))
             if gen == self._load_gen:
                 self.engine_ready.set()
+        if getattr(self.engine, "gpu_missing", False):
+            self.ui.put(self._start_gpu_download)
         self.ui.put(self._refresh_tray)
+
+    # -- GPU support (downloaded on first run, only on PCs with an NVIDIA card)
+    gpu_download = None
+    _gpu_switch_pending = False
+
+    def _start_gpu_download(self):
+        if self.gpu_download and not self.gpu_download.done.is_set():
+            return  # already downloading
+        if gpu.PACKAGE.get("url") is None:
+            return
+        log.info("downloading GPU support (%s %s)", gpu.PACKAGE["name"], gpu.PACKAGE["version"])
+        self.gpu_download = gpu.Download(on_done=lambda d: self.ui.put(self._gpu_download_done)).start()
+        self._gpu_progress_tick()
+
+    def _gpu_progress_tick(self):
+        d = self.gpu_download
+        if d and not d.done.is_set():
+            self._refresh_tray()
+            self.root.after(1000, self._gpu_progress_tick)
+
+    def _gpu_download_done(self):
+        d = self.gpu_download
+        if d.error:
+            log.warning("GPU support download failed (will retry next start): %s", d.error)
+            self.gpu_download = None
+            self._refresh_tray()
+            return
+        log.info("GPU support downloaded")
+        self.gpu_download = None
+        self._gpu_switch_pending = True
+        self._maybe_switch_to_gpu()
+
+    def _maybe_switch_to_gpu(self):
+        """Reload on the GPU once nothing is recording or transcribing."""
+        if not self._gpu_switch_pending:
+            return
+        if self.state != "idle":
+            self.root.after(2000, self._maybe_switch_to_gpu)
+            return
+        self._gpu_switch_pending = False
+        self.reload_engine()
+        self.overlay.message("GPU support installed - transcription is now much faster")
 
     # -- whisper settings (called by the panel)
     def set_whisper(self, key, value):
@@ -599,6 +784,12 @@ class App:
             icon, tip = ICON_REC, f"{APP} - recording ({'+'.join(hotkey_label(self.cfg.hotkey))} to stop)"
         elif self.state == "transcribing" or not self.engine_ready.is_set():
             icon, tip = ICON_BUSY, f"{APP} - working…"
+        elif self.gpu_download:
+            pct = int(self.gpu_download.progress * 100)
+            icon, tip = ICON_IDLE, (f"{APP} - {'+'.join(hotkey_label(self.cfg.hotkey))} to record (CPU)"
+                                    f"\nDownloading GPU support… {pct}%")
+        elif self.engine_error:
+            icon, tip = ICON_REC, f"{APP} - speech model failed to load (press your shortcut to retry)"
         else:
             where = "GPU" if self.engine.device == "cuda" else "CPU"
             icon, tip = ICON_IDLE, f"{APP} - {'+'.join(hotkey_label(self.cfg.hotkey))} to record ({where})"
@@ -647,12 +838,29 @@ class App:
             self._stop()
 
     def _start(self):
+        if not self.engine_ready.is_set():  # first run: model still downloading
+            self.overlay.message("Still loading the speech model - try again in a moment",
+                                 T.WARN_TEXT, 4)
+            return
+        if self.engine_error:  # e.g. offline on first run: try again now
+            self.overlay.message("Speech model isn't loaded - retrying…", T.WARN_TEXT, 4)
+            self.reload_engine()
+            return
         self.panel.close()  # frees the mic it was monitoring
-        stamp =datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.stamp = stamp
         path = os.path.join(AUDIO_DIR, stamp + ".wav")
         try:
-            self.recorder.start(self.cfg.device, path)
+            storage.make_folders(OUT_DIR)  # in case someone deleted it while we ran
+            try:
+                self.recorder.start(self.cfg.device, path)
+            except Exception:
+                # Mic may have been unplugged/replugged: refresh the device list and retry once.
+                log.warning("mic failed to open, refreshing devices and retrying")
+                sd._terminate()
+                sd._initialize()
+                self.mics = list_mics()
+                self.recorder.start(self.cfg.device, path)
         except Exception as e:
             log.exception("could not start recording")
             self.overlay.message(f"Mic error: {e}", T.ERR_TEXT, 4)
@@ -661,11 +869,16 @@ class App:
         self.overlay.recording(self.recorder)
         self._refresh_tray()
 
+    MIN_SECONDS = 0.3
+
     def _stop(self):
         target = user32.GetForegroundWindow()  # where the text should go
         duration = self.recorder.stop()
         path = self.recorder.path
         log.info("saved %s (%.1fs)", path, duration)
+        if duration < self.MIN_SECONDS:  # an accidental double-tap
+            self._finish("Too short - nothing recorded", T.WARN_TEXT)
+            return
         self.state = "transcribing"
         self.overlay.transcribing()
         self._refresh_tray()
@@ -673,28 +886,44 @@ class App:
 
     def _transcribe(self, path, target):
         try:
-            self.engine_ready.wait()
+            if not self.engine_ready.wait(600):
+                raise RuntimeError("speech model is taking too long to load")
             if self.engine_error:
                 raise RuntimeError(f"speech model failed to load: {self.engine_error}")
             t = time.time()
             text = self.engine.transcribe(path)
             log.info("transcribed in %.1fs (%d chars)", time.time() - t, len(text))
-            base = os.path.splitext(os.path.basename(path))[0]
-            with open(os.path.join(TEXT_DIR, base + ".txt"), "w", encoding="utf-8") as f:
-                f.write(text + "\n")
-            self.ui.put(lambda: self._deliver(text, target))
         except Exception as e:
             log.exception("transcription failed")
             msg = f"Transcription failed (audio is saved): {e}"
             self.ui.put(lambda: self._finish(msg, T.ERR_TEXT, 5))
+            return
+        try:  # a failed save must not lose the text
+            storage.make_folders(OUT_DIR)
+            base = os.path.splitext(os.path.basename(path))[0]
+            with open(os.path.join(TEXT_DIR, base + ".txt"), "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            log.exception("could not save transcript")
+        self.ui.put(lambda: self._deliver(text, target))
 
     def _deliver(self, text, target):
         if not text:
             self._finish("No speech detected (audio saved)", T.WARN_TEXT)
             return
-        pyperclip.copy(text)
+        try:
+            try:
+                pyperclip.copy(text)
+            except Exception:  # another app is holding the clipboard
+                time.sleep(0.15)
+                pyperclip.copy(text)
+        except Exception:
+            log.exception("clipboard busy")
+            self._finish("Clipboard is busy - text saved in the text folder", T.ERR_TEXT, 5)
+            return
         try:
             focus_window(target)
+            wait_for_modifiers_released()
             keyboard.send("ctrl+v")
             self._finish("✓ Pasted · copied to clipboard")
         except Exception:
@@ -709,9 +938,11 @@ class App:
     def quit(self):
         if self.state == "recording":
             self.recorder.stop()
-        self.hotkey.stop()
-        keyboard.unhook_all()
-        self.tray.stop()
+        for fn in (self.hotkey.stop, keyboard.unhook_all, self.tray.stop):
+            try:
+                fn()
+            except Exception:
+                log.exception("error while quitting")
         self.root.destroy()
 
     def run(self):

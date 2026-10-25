@@ -7,29 +7,39 @@ Speed tricks:
   pauses (voice detection) and transcribes many chunks at once in parallel.
 """
 import os
-import site
-import sys
+
+import uwhisper_gpu as gpu  # noqa: E402
+
+gpu.ready()  # put cuBLAS on the DLL path if it's already here (bundled or downloaded)
 
 
-def _add_cuda_dll_dirs():
-    """Make the pip-installed NVIDIA libraries (cuBLAS, cuDNN) findable."""
-    if sys.platform != "win32":
+def _stub_av():
+    """faster-whisper imports PyAV (FFmpeg, ~67 MB) at startup, but only uses it to decode
+    audio *files*. uWhisper always passes raw samples (see load_audio_16k), so the exe is
+    built without PyAV and this stand-in satisfies the import. If anything ever does try to
+    decode a file with it, it fails loudly instead of silently."""
+    try:
+        import av  # noqa: F401  (present when running from source)
         return
-    roots = site.getsitepackages() + [site.getusersitepackages()]
-    if hasattr(sys, "_MEIPASS"):  # packaged exe: libraries sit in _internal
-        roots.insert(0, sys._MEIPASS)
-    for root in roots:
-        nv = os.path.join(root, "nvidia")
-        if not os.path.isdir(nv):
-            continue
-        for pkg in os.listdir(nv):
-            b = os.path.join(nv, pkg, "bin")
-            if os.path.isdir(b):
-                os.add_dll_directory(b)
-                os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+    except ImportError:
+        pass
+    import sys
+    import types
+
+    def unavailable(*_a, **_k):
+        raise RuntimeError("uWhisper is built without FFmpeg; pass audio samples, not a file")
+
+    av = types.ModuleType("av")
+    av.open = unavailable
+    av.audio = types.SimpleNamespace(
+        resampler=types.SimpleNamespace(AudioResampler=unavailable),
+        fifo=types.SimpleNamespace(AudioFifo=unavailable))
+    av.error = types.SimpleNamespace(InvalidDataError=type("InvalidDataError", (Exception,), {}))
+    av.__uwhisper_stub__ = True
+    sys.modules["av"] = av
 
 
-_add_cuda_dll_dirs()
+_stub_av()
 
 import ctranslate2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -79,7 +89,12 @@ DEFAULTS = {
 RELOAD_KEYS = ("device", "model", "compute_type", "cpu_threads")
 
 
+_cuda_broken = False  # set after a CUDA failure; retrying in the same process can hang
+
+
 class Engine:
+    gpu_missing = False
+
     def __init__(self, settings, log=print):
         self.settings = settings  # shared dict; transcribe() reads it live
         self.log = log
@@ -90,13 +105,25 @@ class Engine:
         self.model_name = None
 
     def load(self):
+        global _cuda_broken
         s = self.settings
         want = s["device"]
-        if want in ("auto", "cuda") and ctranslate2.get_cuda_device_count() > 0:
+        self.gpu_missing = False  # True: NVIDIA card present but GPU support not downloaded yet
+        has_gpu = want in ("auto", "cuda") and ctranslate2.get_cuda_device_count() > 0
+        if has_gpu and not gpu.ready():
+            # Never try CUDA without cuBLAS: a failed try breaks CUDA until restart.
+            self.gpu_missing = True
+            self.log("NVIDIA GPU found but GPU support isn't downloaded yet, using CPU")
+        elif has_gpu and _cuda_broken:
+            self.log("GPU failed earlier in this session, using CPU until restart")
+        elif has_gpu:
             try:
                 self._load("cuda")
                 return
-            except Exception as e:  # missing DLLs, unsupported GPU, etc.
+            except ValueError:  # bad model name etc. - not the GPU's fault
+                raise
+            except Exception as e:  # unsupported GPU, old driver, out of memory...
+                _cuda_broken = True
                 self.log(f"GPU load failed, falling back to CPU: {e}")
         elif want == "cuda":
             self.log("no CUDA GPU found, using CPU")
@@ -120,6 +147,8 @@ class Engine:
 
     def transcribe(self, path):
         s = self.settings
+        if self.model is None:
+            raise RuntimeError("speech model is not loaded")
         audio = load_audio_16k(path)
         try:
             if s["vad"]:

@@ -17,6 +17,10 @@ import sounddevice as sd
 from PIL import ImageTk
 
 from uwhisper_logo import draw_icon
+import uwhisper_storage as storage
+
+KEEP_UNITS = {"days": "Days", "weeks": "Weeks", "months": "Months", "years": "Years",
+              storage.FOREVER: "Forever"}
 
 user32 = ctypes.windll.user32
 HERE = getattr(__import__("sys"), "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +31,7 @@ from uwhisper_theme import (ACCENT, BG, CARD, DIM, EMBER, GREEN, HOVER, LINE, ON
 from uwhisper_theme import BORDER_DWM as BORDER
 AMBER = EMBER
 ICONS = "Segoe Fluent Icons"
+GLYPH_UP, GLYPH_DOWN, GLYPH_CHECK = "", "", ""
 
 FRAME_MS = 16          # ~60 fps animations
 SWITCH_SECONDS = 0.18  # how long a switch takes to slide
@@ -500,7 +505,7 @@ class Panel:
     def _slide_to(self, x):
         key, lo, hi, step, x0, x1 = self.slider_drag
         frac = min(1.0, max(0.0, (x - x0) / (x1 - x0)))
-        value = lo + round(frac * (hi - lo) / step) * step
+        value = lo + math.floor(frac * (hi - lo) / step + 0.5) * step
         if not self.slider_live or self.slider_live[1] != value:
             self.slider_live = (key, value)
             self._draw()
@@ -510,14 +515,27 @@ class Panel:
         self.app.reset_whisper()
         self.refresh()
 
-    # -- typing a number into a slider's value box
-    def _start_edit(self, key, lo, hi, step):
+    # -- how long to keep audio (main page)
+    def _toggle_keep_dropdown(self):
+        self.dropdown = None if self.dropdown == "keep_unit" else "keep_unit"
+        self._draw()
+
+    def _choose_keep(self, unit):
+        self.dropdown = None
+        self.app.set_cleanup(unit=unit)
+        self._draw()
+
+    # -- typing a number into a value box
+    def _start_edit(self, key, lo, hi, step, value=None, on_commit=None):
+        if self.editing:
+            self._commit_edit()
         self.editing = key
         self.edit_limits = (lo, hi, step)
+        self.edit_commit = on_commit or (lambda v, k=key: self.app.set_whisper(k, v))
         self.entry = tk.Entry(self.cv, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat",
                               justify="center", font=("Segoe UI Semibold", 10),
                               highlightthickness=1, highlightcolor=ACCENT, highlightbackground=ACCENT)
-        self.entry.insert(0, str(self.app.cfg.whisper.get(key)))
+        self.entry.insert(0, str(self.app.cfg.whisper.get(key) if value is None else value))
         self.entry.select_range(0, "end")
         self.entry.bind("<Return>", lambda e: self._commit_edit())
         self.entry.bind("<KP_Enter>", lambda e: self._commit_edit())
@@ -529,19 +547,22 @@ class Panel:
     def _commit_edit(self):
         if not self.editing:
             return
-        key = self.editing
         lo, hi, step = self.edit_limits
+        commit = self.edit_commit
         text = self.entry.get().strip()
         self._cancel_edit()
         try:
             value = float(text)
+            if not math.isfinite(value):
+                value = None
         except ValueError:
             value = None
         if value is not None:
-            value = lo + round((value - lo) / step) * step  # e.g. odd chunk counts -> nearest even
+            value = lo + math.floor((value - lo) / step + 0.5) * step  # odd chunk counts -> next even
             value = int(min(hi, max(lo, value)))
-            self.app.set_whisper(key, value)
-        self._draw()
+            commit(value)
+        if self.win:
+            self._draw()
 
     def _cancel_edit(self):
         if self.entry:
@@ -597,6 +618,9 @@ class Panel:
             return AMBER, "Loading speech model…"
         if app.engine_error:
             return RED, "Speech model failed to load"
+        dl = getattr(app, "gpu_download", None)
+        if dl:
+            return GREEN, f"Ready  ·  CPU  ·  getting GPU support {int(dl.progress * 100)}%"
         return GREEN, "Ready  ·  " + ("GPU" if app.engine.device == "cuda" else "CPU")
 
     # ================================================================ drawing
@@ -616,6 +640,9 @@ class Panel:
         self.H = int(y)
         self.cv.configure(height=self.H)
         if self.win and self.pos:
+            # Keep the whole window above the taskbar when a dropdown makes it taller.
+            l, t, r, b = self.app.work_area()
+            self.pos = (self.pos[0], max(t, min(self.pos[1], b - self.H)))
             self.win.geometry(f"{self.W}x{self.H}+{self.pos[0]}+{self.pos[1]}")
 
     # ---------------------------------------------------------------- main page
@@ -704,6 +731,10 @@ class Panel:
         self.meter = (mx0, my0, mx1, my1)
         y += 22 * S
 
+        # how long to keep audio: [30] [Days v]  (transcripts are always kept)
+        keep_dd = self._draw_keep_row(y)
+        y += 46 * S
+
         cv.create_line(P, y, W - P, y, fill=LINE)
         y += 6 * S
 
@@ -723,7 +754,75 @@ class Panel:
         action("autostart", "", "Start with Windows", self._toggle_autostart,
                right=lambda cy: self._switch(W - P - 18 * S, cy, "autostart", app.autostart_enabled()))
         action("quit", "", "Quit uWhisper", self._quit, color=QUIT)
-        return y + 10 * S
+        y += 10 * S
+        if keep_dd:  # drawn last so it sits on top of the buttons below it
+            y = max(y, self._draw_keep_popup(*keep_dd))
+        return y
+
+    def _draw_keep_row(self, y):
+        """'Keep audio for  [30] [Days v]'. Returns where the dropdown list goes if it's open."""
+        cv, S, W, app = self.cv, self.S, self.W, self.app
+        P = 16 * S
+        rh = 46 * S
+        cy = y + rh / 2
+        c = app.cfg.cleanup
+        forever = c["unit"] == storage.FOREVER
+        self._label(P, cy - 7 * S, "Keep audio for", None, "keep")
+        cv.create_text(P, cy + 10 * S, text="Transcripts are always kept", font=("Segoe UI", 8),
+                       fill=DIM, anchor="w")
+
+        dw, bw, gap, bh = 92 * S, 52 * S, 6 * S, 26 * S
+        dx1 = W - P
+        dx0 = dx1 - dw
+        is_open = self.dropdown == "keep_unit"
+        hov = self.hover == ("keep", "unit")
+        self._rrect(dx0, cy - bh / 2, dx1, cy + bh / 2, 6 * S, fill=HOVER if hov else CARD,
+                    outline=ACCENT if is_open else "", width=max(1, 1.2 * S))
+        cv.create_text(dx0 + 10 * S, cy, text=KEEP_UNITS[c["unit"]], font=("Segoe UI Semibold", 9),
+                       fill=TEXT, anchor="w")
+        cv.create_text(dx1 - 11 * S, cy, text=GLYPH_UP if is_open else GLYPH_DOWN, font=(ICONS, 8), fill=SUB)
+        self._hit(cy - bh / 2, cy + bh / 2, ("keep", "unit"), self._toggle_keep_dropdown, dx0, dx1)
+
+        if not forever:  # number box (click to type)
+            bx1 = dx0 - gap
+            bx0 = bx1 - bw
+            if self.editing == "keep_amount":
+                if cv.find_withtag("entrywin"):
+                    cv.coords("entrywin", (bx0 + bx1) / 2, cy)
+                else:
+                    cv.create_window((bx0 + bx1) / 2, cy, window=self.entry, width=bw, height=bh,
+                                     tags=("keep", "entrywin"))
+            else:
+                nkey = ("num", "keep_amount")
+                self._rrect(bx0, cy - bh / 2, bx1, cy + bh / 2, 6 * S,
+                            fill=HOVER if self.hover == nkey else CARD, outline="")
+                cv.create_text((bx0 + bx1) / 2, cy, text=str(c["amount"]),
+                               font=("Segoe UI Semibold", 9), fill=TEXT)
+                self._hit(cy - bh / 2, cy + bh / 2, nkey,
+                          lambda: self._start_edit("keep_amount", 1, storage.MAX_AMOUNT, 1,
+                                                   value=app.cfg.cleanup["amount"],
+                                                   on_commit=lambda v: app.set_cleanup(amount=v)),
+                          bx0, bx1)
+        return (dx0, dx1, cy + bh / 2 + 4 * S, c["unit"]) if is_open else None
+
+    def _draw_keep_popup(self, x0, x1, top, cur):
+        cv, S = self.cv, self.S
+        ih = 32 * S
+        x0 -= 20 * S
+        bottom = top + ih * len(KEEP_UNITS) + 8 * S
+        self._rrect(x0, top, x1, bottom, 8 * S, fill=POPUP, outline=POPUP_EDGE, width=max(1, S))
+        iy = top + 4 * S
+        for value, text in KEEP_UNITS.items():
+            if self.hover == ("dd", value):
+                self._rrect(x0 + 4 * S, iy, x1 - 4 * S, iy + ih, 5 * S, fill=HOVER, outline="")
+            sel = value == cur
+            if sel:
+                cv.create_text(x0 + 14 * S, iy + ih / 2, text=GLYPH_CHECK, font=(ICONS, 9), fill=ACCENT)
+            cv.create_text(x0 + 28 * S, iy + ih / 2, text=text,
+                           font=("Segoe UI Semibold", 9) if sel else ("Segoe UI", 10), fill=TEXT, anchor="w")
+            self._hit(iy, iy + ih, ("dd", value), lambda v=value: self._choose_keep(v), x0, x1, kind="dd")
+            iy += ih
+        return bottom + 12 * S
 
     def _draw_mics(self):
         mc, S, app = self.mc, self.S, self.app
