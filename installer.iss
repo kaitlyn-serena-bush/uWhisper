@@ -87,8 +87,10 @@ end;
 
 procedure InitializeWizard();
 begin
-  // At high display scaling the task checkboxes were drawn partly off the left edge.
+  // At high display scaling the checkboxes were drawn partly off the left edge:
+  // the tasks page and the "Start uWhisper now" box on the last page.
   WizardForm.TasksList.Offset := ScaleX(8);
+  WizardForm.RunList.Offset := ScaleX(8);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
