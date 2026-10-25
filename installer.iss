@@ -42,7 +42,7 @@ CloseApplications=force
 RestartApplications=no
 
 [Tasks]
-Name: "startup"; Description: "Start uWhisper when I sign in to Windows"
+Name: "startup"; Description: "Run on startup"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
