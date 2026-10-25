@@ -17,6 +17,8 @@ if (-not $iscc) { throw "Inno Setup 6 not found - winget install --id JRSoftware
 
 & (Join-Path $here ".venv\Scripts\python.exe") (Join-Path $here "installer_art.py")
 if ($LASTEXITCODE -ne 0) { throw "installer images failed" }
+& (Join-Path $here ".venv\Scripts\python.exe") (Join-Path $here "build_notices.py")
+if ($LASTEXITCODE -ne 0) { throw "third-party notices failed" }
 & $iscc /Q (Join-Path $here "installer.iss")
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 Get-ChildItem (Join-Path $here "dist\uWhisper-Setup-*.exe") | Sort-Object LastWriteTime |
