@@ -7,3 +7,4 @@ dist/
 .pytest_cache/
 tests/fixtures/tts/
 tests/screenshots/
+installer_art/

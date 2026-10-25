@@ -25,7 +25,13 @@ OutputBaseFilename=uWhisper-Setup-{#AppVersion}
 SetupIconFile=uWhisper.ico
 UninstallDisplayIcon={app}\uWhisper.exe
 UninstallDisplayName={#AppName}
-WizardStyle=modern
+; "windows11" draws its own controls; the plain modern style clipped the task
+; checkboxes at high display scaling (e.g. 300%). "dynamic" follows light/dark mode.
+WizardStyle=modern dynamic windows11
+WizardSmallImageFile=installer_art\small_100.png,installer_art\small_125.png,installer_art\small_150.png,installer_art\small_175.png,installer_art\small_200.png,installer_art\small_250.png,installer_art\small_300.png
+WizardImageFile=installer_art\large_100.png,installer_art\large_125.png,installer_art\large_150.png,installer_art\large_175.png,installer_art\large_200.png,installer_art\large_250.png,installer_art\large_300.png
+WizardSmallImageFileDynamicDark=installer_art\small_100.png,installer_art\small_125.png,installer_art\small_150.png,installer_art\small_175.png,installer_art\small_200.png,installer_art\small_250.png,installer_art\small_300.png
+WizardImageFileDynamicDark=installer_art\large_100.png,installer_art\large_125.png,installer_art\large_150.png,installer_art\large_175.png,installer_art\large_200.png,installer_art\large_250.png,installer_art\large_300.png
 Compression=lzma2/max
 SolidCompression=yes
 LZMANumBlockThreads=4
@@ -77,6 +83,12 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM uWhisper.exe', '', SW_HIDE,
        ewWaitUntilTerminated, Code);
   Sleep(500);
+end;
+
+procedure InitializeWizard();
+begin
+  // At high display scaling the task checkboxes were drawn partly off the left edge.
+  WizardForm.TasksList.Offset := ScaleX(8);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
