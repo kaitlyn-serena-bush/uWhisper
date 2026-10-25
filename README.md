@@ -8,7 +8,7 @@ OpenAI's Whisper model: nothing is uploaded, no account, no subscription.
 
 ## Download
 
-**[Download uWhisper-Setup.exe](../../releases/latest)** (Windows 10/11, 64-bit, ~55 MB)
+**[Download uWhisper-Setup.exe](https://github.com/kaitlyn-serena-bush/uWhisper/releases/latest)** (Windows 10/11, 64-bit, ~55 MB)
 
 Windows may say *"Windows protected your PC"* because the installer isn't code-signed.
 Click **More info → Run anyway**.
