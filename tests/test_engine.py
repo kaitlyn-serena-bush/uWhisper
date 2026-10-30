@@ -124,11 +124,62 @@ def engine(cpu_engine):
 
 def test_defaults_shape():
     for k in ("device", "model", "compute_type", "batch_size", "beam_size",
-              "language", "vad", "cpu_threads"):
+              "language", "vad", "cpu_threads", "style_prompt"):
         assert k in DEFAULTS
     assert set(RELOAD_KEYS) <= set(DEFAULTS)
     assert DEFAULTS["device"] in ("auto", "cuda", "cpu")
     assert int(DEFAULTS["batch_size"]) > 0 and int(DEFAULTS["beam_size"]) > 0
+    # The sample must show both things Whisper is meant to copy: punctuation and fillers.
+    prompt = DEFAULTS["style_prompt"]
+    assert any(c in prompt for c in ".,!?") and prompt[0].isupper()
+    assert any(f in prompt.lower() for f in ("um", "uh", "hmm"))
+
+
+# --------------------------------------------------------------------------- style prompt
+
+class _FakeWhisper:
+    """Stands in for WhisperModel / BatchedInferencePipeline and records the kwargs."""
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def transcribe(self, audio, **kw):
+        self.calls.append(kw)
+        if self.fail:
+            raise RuntimeError("simulated batched failure")
+        return iter([]), None
+
+
+def _fake_engine(tmp_path, fail_batched=False, **settings):
+    e = Engine(dict(DEFAULTS, **settings), log=lambda m: None)
+    e.model, e.pipeline = _FakeWhisper(), _FakeWhisper(fail=fail_batched)
+    p = tmp_path / "x.wav"
+    sf.write(p, _tone(1.0, 16000), 16000, subtype="FLOAT")
+    return e, str(p)
+
+
+@pytest.mark.parametrize("vad", [False, True])
+def test_style_prompt_reaches_batched_and_one_pass(tmp_path, vad):
+    e, path = _fake_engine(tmp_path, fail_batched=True, vad=vad)
+    e.transcribe(path)
+    assert e.pipeline.calls[0]["initial_prompt"] == DEFAULTS["style_prompt"]
+    assert e.model.calls[0]["initial_prompt"] == DEFAULTS["style_prompt"]
+    for kw in e.pipeline.calls + e.model.calls:
+        assert kw["condition_on_previous_text"] is False  # no repetition loops
+
+
+@pytest.mark.parametrize("empty", ["", None])
+def test_style_prompt_can_be_switched_off(tmp_path, empty):
+    e, path = _fake_engine(tmp_path, style_prompt=empty)
+    e.transcribe(path)
+    assert e.pipeline.calls[0]["initial_prompt"] is None
+
+
+def test_style_prompt_missing_from_old_config_is_off(tmp_path):
+    """A config.json saved by 1.1 has no style_prompt key; the engine must not crash."""
+    e, path = _fake_engine(tmp_path)
+    del e.settings["style_prompt"]
+    e.transcribe(path)
+    assert e.pipeline.calls[0]["initial_prompt"] is None
 
 
 # --------------------------------------------------------------------------- load_audio_16k
@@ -338,6 +389,8 @@ def test_cpu_transcribe_long_chunked(engine, tts_clips, vad):
     assert not engine.logs, engine.logs
     # Nothing at chunk boundaries got duplicated wholesale.
     assert len(_words(text)) <= 1.2 * len(_words(expected))
+    # The style prompt keeps Whisper punctuating and capitalising all the way through.
+    assert text.count(".") >= 8 and text[0].isupper(), text
 
 
 @pytest.mark.slow

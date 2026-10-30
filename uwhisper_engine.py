@@ -74,6 +74,13 @@ def quiet_chunks(audio, target=25.0, search=5.0, sr=16000):
     return [{"start": a, "end": b} for a, b in zip(cuts, cuts[1:])]
 
 
+# Whisper copies the *style* of this sample text, so it keeps punctuation and capitals
+# going and writes down fillers (um, uh, hmm) instead of dropping them. Without it, the
+# first filler it hears tips it into a lowercase, unpunctuated "verbatim" style for the
+# rest of the chunk. Measured on a real 2.5 min dictation: no speed cost at all.
+STYLE_PROMPT = ("Um, so, like, here's what I'm thinking about uWhisper... Hmm. Okay, uh, yeah! "
+                "Well, I mean, it's actually really good, right? Let me, um, explain.")
+
 DEFAULTS = {
     "device": "auto",            # auto | cuda | cpu
     "model": "large-v3-turbo",
@@ -83,6 +90,7 @@ DEFAULTS = {
     "language": "en",            # None = auto-detect
     "vad": False,                # skip silent parts (faster, but can drop quiet words)
     "cpu_threads": 0,            # 0 = all cores
+    "style_prompt": STYLE_PROMPT,  # sample text whose punctuation style Whisper copies; "" = off
 }
 
 # Settings that need the model reloaded when they change.
@@ -150,29 +158,26 @@ class Engine:
         if self.model is None:
             raise RuntimeError("speech model is not loaded")
         audio = load_audio_16k(path)
+        # Each chunk is decoded on its own (no conditioning on earlier text, which is what
+        # makes repetition loops spread); the style prompt is what keeps punctuation steady.
+        common = dict(beam_size=int(s["beam_size"]), language=s["language"],
+                      condition_on_previous_text=False,
+                      initial_prompt=s.get("style_prompt") or None)
         try:
             if s["vad"]:
                 # Skip silence: voice detection removes pauses, then chunks run in batches.
                 # Fastest, but can drop very quiet speech.
                 segments, _info = self.pipeline.transcribe(
-                    audio, batch_size=int(s["batch_size"]), beam_size=int(s["beam_size"]),
-                    language=s["language"], vad_filter=True, condition_on_previous_text=False)
+                    audio, batch_size=int(s["batch_size"]), vad_filter=True, **common)
             else:
                 # Keep everything: cut into ~25 s pieces at the quietest nearby moment
                 # (so words aren't split), then transcribe the pieces in parallel.
                 segments, _info = self.pipeline.transcribe(
-                    audio, batch_size=int(s["batch_size"]), beam_size=int(s["beam_size"]),
-                    language=s["language"], vad_filter=False, clip_timestamps=quiet_chunks(audio),
-                    condition_on_previous_text=False)
+                    audio, batch_size=int(s["batch_size"]), vad_filter=False,
+                    clip_timestamps=quiet_chunks(audio), **common)
             return " ".join(seg.text.strip() for seg in segments).strip()
         except Exception as e:  # never lose a recording: fall back to one-pass mode
             self.log(f"parallel transcription failed, retrying one-pass: {e}")
         # One-pass mode: slower, but handles anything.
-        segments, _info = self.model.transcribe(
-            audio,
-            beam_size=int(s["beam_size"]),
-            language=s["language"],
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
+        segments, _info = self.model.transcribe(audio, vad_filter=False, **common)
         return " ".join(seg.text.strip() for seg in segments).strip()
